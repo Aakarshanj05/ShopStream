@@ -1,0 +1,173 @@
+﻿name: shopstream-lakehouse
+
+services:
+  # Separate open-source S3 store for the approved ShopStream canary.
+  # Keep the existing MinIO service and its volume definition unchanged.
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.52
+    container_name: shopstream-seaweedfs
+    command: ["mini", "-dir=/data"]
+    environment:
+      AWS_ACCESS_KEY_ID: ${SEAWEEDFS_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${SEAWEEDFS_SECRET_KEY}
+      S3_BUCKET: ${SEAWEEDFS_BUCKET:-shopstream-warehouse}
+    ports:
+      - "8333:8333"
+    volumes:
+      - shopstream_seaweedfs_data:/data
+    restart: unless-stopped
+    networks: [shopstream]
+
+  minio:
+    image: quay.io/minio/aistor/minio:RELEASE.2026-09-19T17-05-25Z
+    container_name: shopstream-minio
+    command: server /mnt/data --console-address ":9001" --license /minio.license
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - shopstream_minio_data:/mnt/data
+      - ${MINIO_LICENSE_FILE:-./secrets/minio.license}:/minio.license:ro
+    restart: unless-stopped
+    networks: [shopstream]
+
+  nessie-db:
+    image: postgres:16
+    container_name: shopstream-nessie-db
+    environment:
+      POSTGRES_USER: nessie
+      POSTGRES_PASSWORD: ${NESSIE_DB_PASSWORD}
+      POSTGRES_DB: nessie
+    volumes:
+      - shopstream_nessie_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nessie -d nessie"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    networks: [shopstream]
+
+  nessie:
+    image: ghcr.io/projectnessie/nessie:0.109.0
+    container_name: shopstream-nessie
+    depends_on:
+      nessie-db:
+        condition: service_healthy
+    environment:
+      NESSIE_VERSION_STORE_TYPE: JDBC2
+      NESSIE_VERSION_STORE_PERSIST_JDBC_DATASOURCE: postgresql
+      QUARKUS_DATASOURCE_POSTGRESQL_JDBC_URL: jdbc:postgresql://nessie-db:5432/nessie
+      QUARKUS_DATASOURCE_POSTGRESQL_USERNAME: nessie
+      QUARKUS_DATASOURCE_POSTGRESQL_PASSWORD: ${NESSIE_DB_PASSWORD}
+      NESSIE_SERVER_DEFAULT_BRANCH: main
+      QUARKUS_HTTP_PORT: 19120
+      QUARKUS_MANAGEMENT_PORT: 9000
+    ports:
+      - "19120:19120"
+    restart: unless-stopped
+    networks: [shopstream]
+
+  iceberg-runner:
+    image: apache/spark:3.5.9-python3
+    profiles: [tools]
+    hostname: shopstream-iceberg-runner
+    depends_on:
+      - minio
+      - nessie
+    entrypoint: ["/opt/spark/bin/spark-submit"]
+    command:
+      - --master
+      - spark://spark-master:7077
+      - --packages
+      - org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.10.2,org.apache.iceberg:iceberg-aws-bundle:1.10.2,org.projectnessie.nessie-integrations:nessie-spark-extensions-3.5_2.12:0.105.7,org.apache.hadoop:hadoop-aws:3.3.4
+      - --conf
+      - spark.jars.ivy=/opt/spark/dependencies
+      - --conf
+      - spark.jars.ivySettings=/opt/spark-apps/jobs/ivysettings-shopstream.xml
+      - --conf
+      - spark.driver.host=shopstream-iceberg-runner
+      - --conf
+      - spark.driver.bindAddress=0.0.0.0
+      - --conf
+      - spark.driver.port=37002
+      - --conf
+      - spark.blockManager.port=37003
+      - /opt/spark-apps/jobs/iceberg_catalog.py
+    environment:
+      SPARK_MASTER: spark://spark-master:7077
+      SHOPSTREAM_DATA_ROOT: /opt/spark-data
+      NESSIE_URI: http://nessie:19120/api/v2
+      NESSIE_BRANCH: ${NESSIE_BRANCH:-main}
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_BUCKET: ${MINIO_BUCKET:-shopstream-warehouse}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      ICEBERG_RUN_SCHEMA_EVOLUTION_CHECK: ${ICEBERG_RUN_SCHEMA_EVOLUTION_CHECK:-false}
+      ICEBERG_CREATE_TEST_BRANCH: ${ICEBERG_CREATE_TEST_BRANCH:-false}
+    volumes:
+      - ./spark:/opt/spark-apps:ro
+      - shopstream_spark_data:/opt/spark-data:ro
+      - shopstream_spark_dependencies:/opt/spark/dependencies
+    networks: [shopstream]
+
+  iceberg-canary:
+    image: apache/spark:3.5.9-python3
+    profiles: [canary]
+    hostname: shopstream-iceberg-canary
+    depends_on:
+      - seaweedfs
+      - nessie
+    entrypoint: ["/opt/spark/bin/spark-submit"]
+    command:
+      - --master
+      - spark://spark-master:7077
+      - --packages
+      - org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.10.2,org.apache.iceberg:iceberg-aws-bundle:1.10.2,org.projectnessie.nessie-integrations:nessie-spark-extensions-3.5_2.12:0.105.7,org.apache.hadoop:hadoop-aws:3.3.4
+      - --conf
+      - spark.jars.ivy=/opt/spark/dependencies
+      - --conf
+      - spark.jars.ivySettings=/opt/spark-apps/jobs/ivysettings-shopstream.xml
+      - --conf
+      - spark.driver.host=shopstream-iceberg-canary
+      - --conf
+      - spark.driver.bindAddress=0.0.0.0
+      - --conf
+      - spark.driver.port=37012
+      - --conf
+      - spark.blockManager.port=37013
+      - /opt/spark-apps/jobs/iceberg_nessie_canary.py
+    environment:
+      SPARK_MASTER: spark://spark-master:7077
+      NESSIE_URI: http://nessie:19120/api/v2
+      NESSIE_BRANCH: ${NESSIE_BRANCH:-main}
+      SEAWEEDFS_ENDPOINT: http://seaweedfs:8333
+      SEAWEEDFS_BUCKET: ${SEAWEEDFS_BUCKET:-shopstream-warehouse}
+      SEAWEEDFS_ACCESS_KEY: ${SEAWEEDFS_ACCESS_KEY}
+      SEAWEEDFS_SECRET_KEY: ${SEAWEEDFS_SECRET_KEY}
+      ICEBERG_CANARY_MODE: ${ICEBERG_CANARY_MODE:-write}
+      ICEBERG_CANARY_RUN_ID: ${ICEBERG_CANARY_RUN_ID:-shopstream-persistence-20261106}
+    volumes:
+      - ./spark:/opt/spark-apps:ro
+      - shopstream_spark_dependencies:/opt/spark/dependencies
+    networks: [shopstream]
+
+volumes:
+  shopstream_seaweedfs_data:
+  shopstream_minio_data:
+  shopstream_nessie_db_data:
+  shopstream_spark_dependencies:
+    external: true
+    name: shopstream_spark_dependencies
+  shopstream_spark_data:
+    external: true
+    name: shopstream_spark_data
+
+networks:
+  shopstream:
+    external: true
+    name: shopstream_default
+

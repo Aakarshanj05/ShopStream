@@ -1,0 +1,30 @@
+﻿.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+*.py[cod]
+data/
+checkpoints/
+spark-warehouse/
+.terraform/
+.idea/
+.vscode/
+*.log
+airflow/logs/
+secrets/
+diagnostics/
+
+
+# Local backups
+backups/
+
+# Runtime and generated files
+logs/
+*.bak
+*.tmp
+.ipynb_checkpoints/
+
+# Editor and dated source backups
+*.backup*
+*.bak*

@@ -1,0 +1,9 @@
+﻿# Host-side Python event generators
+confluent-kafka>=2.6,<3
+
+# Local Spark development (the production execution runtime is Spark 3.5.9 in Docker)
+pyspark==3.5.9
+
+# Optional: use for S3/MinIO bucket provisioning scripts
+boto3>=1.35,<2
+
